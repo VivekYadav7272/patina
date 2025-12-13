@@ -7,7 +7,8 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec, vec::Vec};
+use zerocopy::{Immutable, IntoBytes};
 
 #[cfg(not(test))]
 use spin::Once;
@@ -23,9 +24,45 @@ use crate::{
 };
 use r_efi::efi;
 
+// To be upstreamed to r_efi.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, IntoBytes, Immutable)]
+pub struct MemoryDescriptor {
+    pub r#type: u32,
+    // padding, required to implement zerocopy::IntoBytes
+    reserved: u32,
+    pub physical_start: efi::PhysicalAddress,
+    pub virtual_start: efi::VirtualAddress,
+    pub number_of_pages: u64,
+    pub attribute: u64,
+}
+
+impl MemoryDescriptor {
+    pub fn new(
+        r#type: u32,
+        physical_start: efi::PhysicalAddress,
+        virtual_start: efi::VirtualAddress,
+        number_of_pages: u64,
+        attribute: u64,
+    ) -> Self {
+        Self { r#type, reserved: 0, physical_start, virtual_start, number_of_pages, attribute }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, IntoBytes, Immutable)]
+pub struct MemoryAttributesTableInternal {
+    pub version: u32,
+    pub number_of_entries: u32,
+    pub descriptor_size: u32,
+    pub reserved: u32,
+    // can't have generic N-sized array, zerocopy gets confused
+    pub entry: [MemoryDescriptor; 0],
+}
+
 // create a wrapper struct so that we can create an install method on it. That way, we can have the install function
 // be a no-op until after ReadyToBoot
-pub struct MemoryAttributesTable(*mut efi::MemoryAttributesTable);
+pub struct MemoryAttributesTable(Box<[u8]>);
 
 // this is a flag to indicate that we have passed ReadyToBoot and can install the MAT on the next runtime memory
 // allocation/deallocation.
@@ -56,12 +93,58 @@ impl MemoryAttributesTable {
             core_install_memory_attributes_table()
         }
     }
+
+    fn from_mat_desc_list(mat_desc_list: Vec<MemoryDescriptor>) -> Self {
+        let mat_internal = MemoryAttributesTableInternal {
+            version: efi::MEMORY_ATTRIBUTES_TABLE_VERSION,
+            number_of_entries: mat_desc_list.len() as u32,
+            descriptor_size: size_of::<MemoryDescriptor>() as u32,
+            reserved: 0,
+            entry: [],
+        };
+        let buffer_size =
+            mat_desc_list.len() * size_of::<MemoryDescriptor>() + size_of::<MemoryAttributesTableInternal>();
+        let mut buff = vec![0u8; buffer_size].into_boxed_slice();
+        let (mat_buff, mat_desc_list_buff) = buff.split_at_mut(size_of::<MemoryAttributesTableInternal>());
+        mat_buff.copy_from_slice(mat_internal.as_bytes());
+        mat_desc_list_buff.copy_from_slice(mat_desc_list.as_slice().as_bytes());
+
+        Self(buff)
+    }
+
+    fn as_ptr(&self) -> *const MemoryAttributesTableInternal {
+        self.0.as_ptr() as *const _
+    }
+}
+
+impl Default for MemoryAttributesTable {
+    fn default() -> Self {
+        // Self-note: BootServicesData is basically just the default allocator (see documentation for MemoryManager trait)
+        // so replace with the simpler global allocation API.
+        let empty_mat = MemoryAttributesTableInternal {
+            version: 0,
+            number_of_entries: 0,
+            descriptor_size: 0,
+            reserved: 0,
+            entry: [],
+        };
+
+        let mut empty_mat_buff = Box::new([0u8; core::mem::size_of::<MemoryAttributesTableInternal>()]);
+        empty_mat_buff.copy_from_slice(empty_mat.as_bytes());
+
+        Self(empty_mat_buff)
+    }
 }
 
 impl Debug for MemoryAttributesTable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let mat = unsafe { self.0.as_ref().expect("BAD MAT PTR") };
-        let entries = unsafe { slice::from_raw_parts(mat.entry.as_ptr(), mat.number_of_entries as usize) };
+        // SAFETY: All the ways to create Self always have a valid MemoryAttributesTableInternal at the base.
+        let mat = &unsafe { *(self.0.as_ptr() as *const _ as *const MemoryAttributesTableInternal) };
+        let entries = unsafe {
+            // This awkward pointer conversion lives until the zerocopy derives are upstreamed.
+            // But this should still be good since the representation should be identical.
+            slice::from_raw_parts(mat.entry.as_ptr() as *const efi::MemoryDescriptor, mat.number_of_entries as usize)
+        };
 
         writeln!(f, "MemoryAttributesTable {{")?;
         writeln!(f, "  version: {:#X}", mat.version)?;
@@ -102,39 +185,24 @@ extern "efiapi" fn core_install_memory_attributes_table_event_wrapper(event: efi
 }
 
 pub fn core_install_memory_attributes_table() {
+    let mut st_guard = systemtables::SYSTEM_TABLE.lock();
+    let st = st_guard.as_mut().expect("System table support not initialized");
+
     if !POST_RTB.is_completed() {
-        if get_configuration_table(&efi::MEMORY_ATTRIBUTES_TABLE_GUID).is_none() {
+        let current_mat = get_configuration_table(&efi::MEMORY_ATTRIBUTES_TABLE_GUID);
+        if current_mat.is_none() {
             // we need to install an empty configuration table the first time here, because core_install_configuration_table
             // may allocate runtime memory. Because it actually gets installed we need to allocate one here, it will be
             // freed below when we install the real MAT. If we don't allocate this on the heap, we may have undefined
             // behavior with a stack pointer that goes out of scope
-            match core_allocate_pool(efi::BOOT_SERVICES_DATA, size_of::<efi::MemoryAttributesTable>()) {
-                Ok(empty_ptr) => {
-                    if let Some(empty_mat) = unsafe { (empty_ptr as *mut efi::MemoryAttributesTable).as_mut() } {
-                        *empty_mat = efi::MemoryAttributesTable {
-                            version: 0,
-                            number_of_entries: 0,
-                            descriptor_size: 0,
-                            reserved: 0,
-                            entry: [],
-                        };
-                        let mut st_guard = systemtables::SYSTEM_TABLE.lock();
-                        let st = st_guard.as_mut().expect("System table support not initialized");
+            let mat = MemoryAttributesTable::default();
+            let mat_ptr = mat.as_ptr();
 
-                        if let Err(status) =
-                            core_install_configuration_table(efi::MEMORY_ATTRIBUTES_TABLE_GUID, empty_ptr, st)
-                        {
-                            log::error!(
-                                "Failed to create a null MAT table with status {status:#X?}, cannot create MAT"
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::error!("Failed to allocate memory for a null MAT! Status {err:#X?}");
-                    return;
-                }
+            if let Err(status) =
+                core_install_configuration_table(efi::MEMORY_ATTRIBUTES_TABLE_GUID, mat_ptr as *mut c_void, st)
+            {
+                log::error!("Failed to create a null MAT table with status {status:#X?}, cannot create MAT");
+                return;
             }
         }
         // now we want to capture any future runtime memory changes, so we will mark that ReadyToBoot has occurred
@@ -157,83 +225,47 @@ pub fn core_install_memory_attributes_table() {
     }
 
     // this allocates memory to do the collect, but that's okay because it is boot services memory
-    let mat_desc_list: Vec<efi::MemoryDescriptor> = desc_list
+    let mat_desc_list: Vec<MemoryDescriptor> = desc_list
         .iter()
         .filter_map(|descriptor| {
             // we only want the EfiRuntimeServicesCode and EfiRuntimeServicesData sections in the MAT
             match descriptor.r#type {
-                efi::RUNTIME_SERVICES_CODE | efi::RUNTIME_SERVICES_DATA => {
-                    Some(efi::MemoryDescriptor {
-                        attribute: MemoryProtectionPolicy::apply_memory_attributes_table_policy(
-                            descriptor.attribute,
-                            descriptor.r#type,
-                        ),
-                        // use all other fields from the GCD descriptor
-                        ..*descriptor
-                    })
-                }
+                efi::RUNTIME_SERVICES_CODE | efi::RUNTIME_SERVICES_DATA => Some(MemoryDescriptor::new(
+                    descriptor.r#type,
+                    descriptor.physical_start,
+                    descriptor.virtual_start,
+                    descriptor.number_of_pages,
+                    MemoryProtectionPolicy::apply_memory_attributes_table_policy(
+                        descriptor.attribute,
+                        descriptor.r#type,
+                    ),
+                )),
                 _ => None,
             }
         })
         .collect();
 
-    // allocate memory for the MAT and publish it
-    let buffer_size =
-        mat_desc_list.len() * size_of::<efi::MemoryDescriptor>() + size_of::<efi::MemoryAttributesTable>();
-    match core_allocate_pool(efi::BOOT_SERVICES_DATA, buffer_size) {
-        Err(err) => {
-            log::error!("Failed to allocate memory for the MAT! Status {err:#X?}");
+    let mat = MemoryAttributesTable::from_mat_desc_list(mat_desc_list);
+    let mat_ptr = mat.as_ptr();
+
+    match core_install_configuration_table(efi::MEMORY_ATTRIBUTES_TABLE_GUID, mat_ptr as *mut c_void, st) {
+        Err(status) => {
+            log::error!("Failed to install MAT table! Status {status:#X?}");
             return;
         }
-        Ok(void_ptr) => {
-            let mat_descriptors_ptr = mat_desc_list.as_ptr() as *mut u8;
-            let mat_ptr = void_ptr as *mut efi::MemoryAttributesTable;
-            if mat_ptr.is_null() {
-                log::error!("Got a null ptr in successful return from allocate_pool. Failed to create MAT.");
-                return;
+
+        Ok(_) => {
+            // free the old MAT table if we have one
+            let current_mat = get_configuration_table(&efi::MEMORY_ATTRIBUTES_TABLE_GUID);
+            log::info!("Dumping MAT: {mat:?}");
+            if let Some(current_mat) = current_mat
+                && let Err(err) = core_free_pool(current_mat.as_ptr())
+            {
+                log::error!("Error freeing previous MAT pointer: {err:#X?}");
             }
-
-            // this ends up being a large unsafe block because we have to dereference the raw pointer core_allocate_pool
-            // gave us and convert it to a real type and back in order to install it
-            unsafe {
-                let mat = &mut *mat_ptr;
-                mat.version = efi::MEMORY_ATTRIBUTES_TABLE_VERSION;
-                mat.number_of_entries = mat_desc_list.len() as u32;
-                mat.descriptor_size = size_of::<efi::MemoryDescriptor>() as u32;
-                mat.reserved = 0;
-
-                let copy_ptr = core::ptr::from_ref(&mat.entry) as *mut u8;
-
-                core::ptr::copy(
-                    mat_descriptors_ptr,
-                    copy_ptr,
-                    mat_desc_list.len() * size_of::<efi::MemoryDescriptor>(),
-                );
-
-                let mut st_guard = systemtables::SYSTEM_TABLE.lock();
-                let st = st_guard.as_mut().expect("System table support not initialized");
-
-                match core_install_configuration_table(efi::MEMORY_ATTRIBUTES_TABLE_GUID, void_ptr, st) {
-                    Err(status) => {
-                        log::error!("Failed to install MAT table! Status {status:#X?}");
-                        if let Err(err) = core_free_pool(void_ptr) {
-                            log::error!("Error freeing newly allocated MAT pointer: {err:#X?}");
-                        }
-                        return;
-                    }
-                    Ok(Some(current_ptr)) => {
-                        // free the old MAT table if we have one
-                        if let Err(err) = core_free_pool(current_ptr.as_ptr()) {
-                            log::error!("Error freeing previous MAT pointer: {err:#X?}");
-                        }
-                    }
-                    Ok(None) => (),
-                }
-            }
-
-            log::info!("Dumping MAT: {:?}", MemoryAttributesTable(mat_ptr));
         }
     }
+
     log::info!("Successfully installed MAT table!");
 }
 
