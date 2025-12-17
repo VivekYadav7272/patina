@@ -165,6 +165,48 @@ Resource Descriptor HOB v2 describing it.
 > Platforms must create Resource Descriptor HOB v2s for all memory resources including MMIO and reserved memory with
 > a valid cacheability attribute set.
 
+#### 2.2.1 Resource Descriptor Hob v2 Guidance
+
+Resource Descriptor HOBs are produced by a platform to describe ranges that compose the system's memory map.
+Historically, some platforms have only described memory that is in use, but the HOBs should describe the
+entire system memory map, as it stands, at the end of the HOB-producer phase. This includes caching
+attributes in V2 resource descriptor HOBs so that Patina is able to consume the data and provide enhanced
+memory protections from the start of DXE.
+
+##### PEI Video Region Example
+
+By the start of DXE, most system memory should be configured as Write Back (EFI_MEMORY_WB), and most Memory Mapped I/O
+should be configured as uncached (EFI_MEMORY_UC). There are exceptions to this, based upon platform level decisions.
+
+One example is a PEI Video driver. If PEI configured a video device and displayed a logo on the screen, the memory
+region associated with the frame buffer would usually be configured as write combined (EFI_MEMORY_WC) for performance.
+If the video region was not configured as write combined, then attempting to display anything on the screen would be
+extremely slow. The caching attributes for this region would need to be reported through a non-overlapping resource
+descriptor HOB for that region.
+
+The write combined cache setting would persist throughout the rest of the boot process, including after GOP drivers
+start managing the video device. The other transition point would be prior to handing off to the OS. At that point,
+the region would transition to uncached (EFI_MEMORY_UC). The OS would then be responsible to managing caching attributes.
+
+##### Firmware Devices
+
+SPI flash accessible through MMIO is another complex example.
+
+Consider the following scenario:
+
+- 64MB SPI part, mapped to 0xFC00_0000 - 0xFFFF_FFFF.
+- FVs in the SPI part
+  - 0xFD00_0000 - 0xFD04_FFFF - Non Volatile Ram
+  - 0xFD05_0000 - 0xFE40_FFFF - DXE code
+  - 0xFF00_0000 - 0xFFFF_FFFF - PEI code
+- HPET enabled, mapped to 0xFED0_0000 - 0xFED0_03FF.
+
+Note: Both the HPET region and the FV hobs overlaps with the SPI region.
+
+The HPET should have a MMIO resource descriptor HOB for its region, with cache type uncached (EFI_MEMORY_UC).
+The SPI flash can be reported around the HPET region as MMIO resources with the uncached attribute (EFI_MEMORY_UC)
+and with the memory type write protect (EFI_MEMORY_WP).
+
 #### 2.3 Overlapping HOBs Prohibited
 
 Patina does not allow there to be overlapping Resource Descriptor HOB v2s in the system and the DXE Readiness Tool will
